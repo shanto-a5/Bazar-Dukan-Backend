@@ -55,4 +55,31 @@ const authenticate = asyncHandlers(async (req, res, next) => {
     next();
 });
 
-export { authenticate };
+/**
+ * Best-effort authentication for routes that work signed-out but can personalise
+ * when a session is present.
+ *
+ * Unlike `authenticate` it never rejects: a missing, malformed or expired token
+ * simply leaves `req.user` unset and the request continues as an anonymous one.
+ * That is the right shape for quick-account, where an existing session means
+ * "resolve this device's account" and anything else means "create a new one" —
+ * a bad token must not turn into a hard 401 the customer cannot act on.
+ */
+const optionalAuthenticate = asyncHandlers(async (req, res, next) => {
+    const header = req.header("authorization");
+    if (header === undefined) return next();
+
+    const match = BEARER_PATTERN.exec(header.trim());
+    if (!match) return next();
+
+    try {
+        const { user, sessionId } = await authenticateToken(match[1]);
+        req.user = user;
+        req.sessionId = sessionId;
+    } catch {
+        // An unusable token is ignored on purpose (see the doc comment).
+    }
+    return next();
+});
+
+export { authenticate, optionalAuthenticate };

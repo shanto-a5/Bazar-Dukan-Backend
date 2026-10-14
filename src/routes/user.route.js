@@ -1,12 +1,14 @@
 import { Router } from "express";
-import { authenticate } from "../middlewares/auth.middleware.js";
+import { authenticate, optionalAuthenticate } from "../middlewares/auth.middleware.js";
 import { createRateLimit } from "../middlewares/rateLimit.middleware.js";
 import {
     registerUser,
+    quickAccountUser,
     loginUser,
     getCurrentUser,
     updateCurrentUser,
     updateCurrentUserPassword,
+    updateCurrentUserPasswordInitial,
     logoutCurrentUser,
     logoutCurrentUserEverywhere,
     requestPasswordResetEmail,
@@ -32,6 +34,17 @@ const router = Router();
 router
     .route("/register")
     .post(createRateLimit({ bucket: "auth-login", windowMs: 15 * 60 * 1000, max: 100 }), registerUser);
+// frictionless onboarding: phone-only account creation. `optionalAuthenticate`
+// lets a device that already holds a session resolve to that account instead of
+// creating a duplicate; it is rate-limited on its own bucket because a caller
+// can mint accounts without a password.
+router
+    .route("/quick-account")
+    .post(
+        createRateLimit({ bucket: "auth-quick-account", windowMs: 15 * 60 * 1000, max: 60 }),
+        optionalAuthenticate,
+        quickAccountUser
+    );
 router
     .route("/login")
     .post(createRateLimit({ bucket: "auth-login", windowMs: 15 * 60 * 1000, max: 100 }), loginUser);
@@ -40,6 +53,10 @@ router
 router.route("/me").get(authenticate, getCurrentUser);
 router.route("/me").patch(authenticate, updateCurrentUser);
 router.route("/me/password").post(authenticate, updateCurrentUserPassword);
+// One-time first password for a quick account: still authenticated (the actor
+// is the session), but no current password — the service refuses once the
+// account already has one, so the no-password path can never be reused.
+router.route("/me/password/initial").post(authenticate, updateCurrentUserPasswordInitial);
 
 // session invalidation: this device, or every device
 router.route("/logout").post(authenticate, logoutCurrentUser);

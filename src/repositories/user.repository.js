@@ -11,6 +11,18 @@ const findByEmailWithSecrets = (email) => User.findOne({ email }).select("+passw
 
 const findByIdWithSecrets = (userId) => User.findById(userId).select("+passwordHash +passwordSalt");
 
+/**
+ * All accounts that share a phone number, with secrets.
+ *
+ * `phone` is deliberately not unique (quick accounts record it as contact
+ * detail, never as an identifier), so a phone sign-in has to look at every
+ * candidate and let the caller verify the password against each. Ordered newest
+ * first so a phone reused across accounts resolves to the most recent one when
+ * more than one password happens to match.
+ */
+const findByPhoneWithSecrets = (phone) =>
+    User.find({ phone }).sort({ createdAt: -1 }).select("+passwordHash +passwordSalt");
+
 const findById = (userId) => User.findById(userId);
 
 const findByEmail = (email) => User.findOne({ email });
@@ -28,6 +40,7 @@ const emailOwnedByOther = async (email, userId) => {
 export {
     findByEmailWithSecrets,
     findByIdWithSecrets,
+    findByPhoneWithSecrets,
     findById,
     findByEmail,
     insert,

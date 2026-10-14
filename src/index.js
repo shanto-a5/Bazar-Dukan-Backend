@@ -20,7 +20,7 @@ ConnectDB()
     const port = process.env.PORT || 4000;
 
     const server = app.listen(port, ()=>{
-        console.log(`app running on port http://localhost:${port}/health`)
+        console.log(`app running on port http://localhost:${port}`)
     })
 
     // close the listener before the database so an in-flight request finishes

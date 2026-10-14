@@ -70,7 +70,7 @@ Decided once, in `src/utils/ApiResponse.js` and `src/middlewares/error.middlewar
 ### Auth model
 
 - **Credential**: an opaque 64-hex session token issued by
-  `POST /auth/register` and `POST /auth/login`, sent as
+  `POST /auth/register`, `POST /auth/quick-account` and `POST /auth/login`, sent as
   `Authorization: Bearer <token>`. This is **not a JWT** — there is no payload
   and no signature to forge; `src/utils/token.js` stores only a SHA-256 digest
   and every request is resolved server-side against the `Session` collection.
@@ -270,10 +270,12 @@ All paths are relative to `/api/v1`. Auth column:
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | POST | `/auth/register` | public | Create account, start session, return token |
-| POST | `/auth/login` | public | Sign in, start session, return token |
-| GET | `/auth/me` | customer | Current user (public projection) |
+| POST | `/auth/quick-account` | public (optional session) | Frictionless onboarding: phone only, server mints serial name + placeholder email + random password (owner has none), start session. A valid bearer session resolves to that account instead of creating a duplicate. |
+| POST | `/auth/login` | public | Sign in with an email **or** the phone a quick account was created with, plus the password; start session, return token. A phone is never accepted without the password. |
+| GET | `/auth/me` | customer | Current user (public projection, includes `hasPassword`) |
 | PATCH | `/auth/me` | customer | Update own profile (name/email/phone/avatar) |
 | POST | `/auth/me/password` | customer | Change password, revoke other sessions |
+| POST | `/auth/me/password/initial` | customer | One-time first password on a quick account: no `currentPassword`. Refused (409) once the account already has a password. |
 | POST | `/auth/logout` | customer | Revoke this session |
 | POST | `/auth/logout-all` | customer | Revoke every session for the account |
 | POST | `/auth/password-reset/request` | public | Mail a single-use reset link; identical answer for known/unknown address |
@@ -446,13 +448,14 @@ nothing above is aspirational.
 
 ## 5. Data model
 
-21 models in `src/models/`. Embedded documents are marked.
+22 models in `src/models/`. Embedded documents are marked.
 
 | Model | Purpose and key fields |
 | --- | --- |
 | `User` | Account: `name`, `email` (unique), `phone`, `passwordHash`/`passwordSalt` (`select: false`), `avatar`, `roles[]` (`customer`\|`seller`\|`seller_approver`). `toPublicUser` is the only projection that leaves the process. |
 | `Session` | One opaque bearer token: `userId`, `tokenHash` (SHA-256 only), `expiresAt` with a TTL index. |
 | `PasswordReset` | Single-use reset ticket: `userId`, `tokenHash`, `expiresAt`, `usedAt` (conditional claim prevents double spend). |
+| `Counter` | Atomic named sequence (`_id` = key, `seq`). `findOneAndUpdate` `$inc`+upsert hands out the serial part of a quick-account display name (`Customer N`); no two callers ever read the same number. |
 | `SellerProfile` | One per user (`userId` unique): identity + `sellerType`, flat pickup/return address strings, embedded `bank` and `agreement`, `status` (`pending`\|`active`\|`rejected`\|`suspended`), `decidedAt`/`decisionNote` (mutable latest-decision view), append-only `decisionHistory[]` (`decision`, `actorId`/`actorLabel`, `at`, `note`). |
 | `Store` | One per seller (`sellerId` unique): `name`, `logo`, `banner`, `status`, rating counters, `shippingFee`, `freeShippingThreshold`, embedded `deliveryEstimateDays {min,max}`, `productCount`, `verified`. |
 | `Category` | Tree node: `name`, `icon`, `image`, `parentId` (null = top level), `order`. |
@@ -526,6 +529,7 @@ database (`UP`).
 | Suite | Test database | Covers |
 | --- | --- | --- |
 | `auth.test.js` | `vanta_test` | Registration, login, `/auth/me`, profile/password changes, logout / logout-all, password reset (identical known/unknown answers, single use, session revocation), `/health` + `/health/ready`, envelope and `x-request-id` |
+| `quick-account.test.js` | `vanta_quick_test` | Phone-only creation, serial `Customer N` name, placeholder email, session token authenticates, distinct accounts, session resolve (no duplicate), field errors, server-only field rejection, and the first-password flow: `hasPassword:false`, one-time `/auth/me/password/initial`, sign-in by phone+password, replay refused (409), normal accounts refused (409), no phone-only sign-in |
 | `mail.test.js` | `vanta_mail_test` | Provider selection, `assertMailConfig` failures, reset delivery through the mailer; a stubbed Resend client means no real email is ever sent |
 | `browse.test.js` | `vanta_browse_test` | The unauthenticated surface: the public catalogue reads (visibility, both paging dialects, search, filters, detail, store, summary) and the three `/meta/*` capability routes — not one request carries an `Authorization` header |
 | `cart.test.js` | `vanta_cart_test` | Add/merge, quantity clamp, select/deselect, clear, pricing groups, availability |
@@ -604,6 +608,14 @@ Rules that hold for the whole suite:
 - **Password reset is enumeration-safe**: request answers identically for a
   known and an unknown address, stores only a digest, and both reset routes
   are unauthenticated by design.
+- **A quick account's first password is a one-time, authenticated write.** The
+  account's `passwordSet` flag is `false` only for quick accounts; while it is
+  false `/auth/me/password/initial` sets the password without a
+  `currentPassword` and flips the flag in the same update, so the no-password
+  path can never be replayed and a normal account (default `true`) can never
+  take it. Sign-in accepts an email or a phone, but a phone is not unique and
+  is never proof on its own — the password is always required and compared
+  against every account that carries the number.
 - **Mail provider split**: `MAIL_PROVIDER=console` for development and tests
   (never in production — boot fails), `MAIL_PROVIDER=resend` for real
   delivery, with `RESEND_API_KEY` required at boot and read but never printed.
@@ -616,6 +628,8 @@ Rules that hold for the whole suite:
   `Cache-Control: no-store`).
 - **Rate-limited identity routes.** `POST /auth/register` and
   `POST /auth/login` share one per-IP window (100 / 15 min);
+  `POST /auth/quick-account` has its own per-IP bucket (60 / 15 min) because it
+  mints accounts without a password;
   `/auth/password-reset/request` is 25 / 15 min and `/auth/password-reset/confirm`
   is 50 / 15 min (`src/middlewares/rateLimit.middleware.js`), answering 429
   `rate_limited` with a client-facing message. Buckets are process-local, so

@@ -65,18 +65,69 @@ const validateRegister = (body) => {
     return { name, email, phone, password };
 };
 
+/**
+ * Quick account: the frictionless onboarding path. The only thing the customer
+ * supplies is a phone number — the display name, the sign-in email and the
+ * password are all generated server-side, so this validator never sees (and
+ * never accepts) the fields a normal register would. The same
+ * `PHONE_PATTERN` the register/login paths use is the single phone rule.
+ */
+const validateQuickAccount = (body) => {
+    if (!isPlainObject(body)) throw validationError("Request body must be an object.", []);
+
+    const fields = [];
+    rejectServerOnlyFields(body, fields);
+
+    const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+    if (!PHONE_PATTERN.test(phone)) fields.push({ field: "phone", message: "Enter a valid phone number." });
+
+    if (fields.length > 0) throw validationError("Please fix the highlighted fields.", fields);
+    return { phone };
+};
+
+/**
+ * Sign-in. The single identifier field carries either an email, or the phone
+ * number a quick account was created with — quick accounts have a generated
+ * placeholder address, so the phone is the only thing their owner can type.
+ * Whatever arrives is normalised to `identifier`; the service decides how to
+ * look it up. A phone still needs the password (the phone is not unique and is
+ * never proof on its own), which is why there is no phone-only branch here.
+ */
 const validateLogin = (body) => {
     if (!isPlainObject(body)) throw validationError("Request body must be an object.", []);
 
     const fields = [];
-    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+    const raw = typeof body.email === "string" ? body.email.trim() : "";
     const password = typeof body.password === "string" ? body.password : "";
 
-    if (!emailValidator(email)) fields.push({ field: "email", message: "Enter a valid email address." });
+    let identifier = "";
+    if (emailValidator(raw)) identifier = raw.toLowerCase();
+    else if (PHONE_PATTERN.test(raw)) identifier = raw;
+    else fields.push({ field: "email", message: "Enter the email or phone number on your account." });
+
     if (password === "") fields.push({ field: "password", message: "Enter your password." });
 
     if (fields.length > 0) throw validationError("Please fix the highlighted fields.", fields);
-    return { email, password };
+    return { identifier, password };
+};
+
+/**
+ * First password on a quick account. There is no `currentPassword`: the account
+ * never had one its owner knew. Whether this call is allowed at all is decided
+ * in the service from the account's `passwordSet` flag, not from the request.
+ */
+const validateInitialPassword = (body) => {
+    if (!isPlainObject(body)) throw validationError("Request body must be an object.", []);
+
+    const fields = [];
+    const newPassword = typeof body.newPassword === "string" ? body.newPassword : "";
+
+    if (newPassword.length < MIN_PASSWORD_LENGTH) {
+        fields.push({ field: "newPassword", message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` });
+    }
+
+    if (fields.length > 0) throw validationError("Please fix the highlighted fields.", fields);
+    return { newPassword };
 };
 
 /**
@@ -174,9 +225,11 @@ const validateResetConfirm = (body) => {
 export {
     validationError,
     validateRegister,
+    validateQuickAccount,
     validateLogin,
     validateProfilePatch,
     validateChangePassword,
+    validateInitialPassword,
     validateResetRequest,
     validateResetConfirm
 };

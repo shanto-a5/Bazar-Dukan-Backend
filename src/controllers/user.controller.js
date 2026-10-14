@@ -3,19 +3,23 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import {
     validateRegister,
+    validateQuickAccount,
     validateLogin,
     validateProfilePatch,
     validateChangePassword,
+    validateInitialPassword,
     validateResetRequest,
     validateResetConfirm
 } from "../validators/auth.validator.js";
 import {
     register,
+    quickAccount,
     login,
     logout,
     logoutAll,
     updateProfile,
     changePassword,
+    setInitialPassword,
     requestPasswordReset,
     confirmPasswordReset
 } from "../services/auth.service.js";
@@ -58,6 +62,22 @@ const registerUser = asyncHandlers(async (req, res) => {
         .json(new ApiResponse(201, result, "Your account is ready."));
 });
 
+// POST /api/v1/auth/quick-account
+//
+// Frictionless onboarding: the client sends only a phone number and the server
+// mints the account (serial display name, placeholder email, random password)
+// and starts a session, exactly like register. `req.user` is set only when the
+// caller already holds a valid session (the route runs `optionalAuthenticate`),
+// in which case the existing account is resolved instead of duplicated.
+const quickAccountUser = asyncHandlers(async (req, res) => {
+    const input = validateQuickAccount(req.body);
+    const result = await quickAccount({ phone: input.phone, existingUserId: req.user?.id });
+
+    return attachSessionCookie(res, result.token)
+        .status(201)
+        .json(new ApiResponse(201, result, "Your account is ready."));
+});
+
 // POST /api/v1/auth/login
 const loginUser = asyncHandlers(async (req, res) => {
     const input = validateLogin(req.body);
@@ -87,6 +107,18 @@ const updateCurrentUserPassword = asyncHandlers(async (req, res) => {
     const result = await changePassword(req.user.id, currentPassword, newPassword, req.sessionId);
 
     return res.status(200).json(new ApiResponse(200, result, "Password updated."));
+});
+
+// POST /api/v1/auth/me/password/initial
+//
+// The one-time, no-current-password path for a quick account. Authenticated
+// like every `/me` route — the actor is the session, never the body — and the
+// service refuses it the moment the account already has an owner-set password.
+const updateCurrentUserPasswordInitial = asyncHandlers(async (req, res) => {
+    const { newPassword } = validateInitialPassword(req.body);
+    const result = await setInitialPassword(req.user.id, newPassword, req.sessionId);
+
+    return res.status(200).json(new ApiResponse(200, result, "Password set."));
 });
 
 // POST /api/v1/auth/logout — this session only
@@ -121,10 +153,12 @@ const confirmPasswordResetEmail = asyncHandlers(async (req, res) => {
 
 export {
     registerUser,
+    quickAccountUser,
     loginUser,
     getCurrentUser,
     updateCurrentUser,
     updateCurrentUserPassword,
+    updateCurrentUserPasswordInitial,
     logoutCurrentUser,
     logoutCurrentUserEverywhere,
     requestPasswordResetEmail,

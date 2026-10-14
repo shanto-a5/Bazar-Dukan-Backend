@@ -1,6 +1,8 @@
 import bcrypt from "bcrypt";
+import { randomBytes } from "node:crypto";
 import { ApiError } from "../utils/ApiError.js";
 import { generateOpaqueToken, hashToken, isWellFormedToken } from "../utils/token.js";
+import { emailValidator } from "../utils/helper/email.validator.js";
 import { toPublicUser } from "../models/user.model.js";
 import {
     bcryptRounds,
@@ -12,6 +14,7 @@ import {
 import * as userRepo from "../repositories/user.repository.js";
 import * as sessionRepo from "../repositories/session.repository.js";
 import * as passwordResetRepo from "../repositories/password-reset.repository.js";
+import * as counterRepo from "../repositories/counter.repository.js";
 import { sendMail } from "./mailer.js";
 
 /**
@@ -140,8 +143,92 @@ const register = async (input) => {
     return { user: toPublicUser(user), token: session.token, expiresAt: session.expiresAt };
 };
 
+/**
+ * Quick account — frictionless customer onboarding (M14).
+ *
+ * The client proves nothing but a phone number, so the server owns every other
+ * credential: a unique placeholder email (the account is never reachable by
+ * mail and cannot collide with a real sign-up), a random password that is never
+ * shown and never reused (the session token is the only way in), and a serial
+ * display name ("Customer N") drawn from an atomic counter.
+ *
+ * The phone is recorded but is deliberately NOT a login credential and is NOT
+ * used to resolve an existing account. Without a one-time code a phone number
+ * is not proof of ownership, so treating it as one would be an account-takeover
+ * oracle. The only safe "resolve" is a caller that already holds a live
+ * session: it keeps that identity instead of creating a duplicate.
+ */
+const QUICK_ACCOUNT_COUNTER = "quickAccount";
+const QUICK_EMAIL_DOMAIN = "quick.vanta.local";
+
+const quickPlaceholderEmail = () => `customer.${randomBytes(8).toString("hex")}@${QUICK_EMAIL_DOMAIN}`;
+
+const quickAccount = async ({ phone, existingUserId }) => {
+    if (existingUserId) {
+        const existing = await userRepo.findById(existingUserId);
+        if (existing) {
+            const session = await issueSession(existing._id);
+            return { user: toPublicUser(existing), token: session.token, expiresAt: session.expiresAt };
+        }
+    }
+
+    const seq = await counterRepo.nextValue(QUICK_ACCOUNT_COUNTER);
+    const { passwordHash, passwordSalt } = await hashPassword(randomBytes(24).toString("hex"));
+
+    // The placeholder email is random, so a collision is astronomically
+    // unlikely; the unique index still guards it and a collision is retried with
+    // a fresh address rather than surfaced as a 409 the customer could not act
+    // on. The password hash is computed once and reused across retries.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+        const email = quickPlaceholderEmail();
+        try {
+            const user = await userRepo.insert({
+                name: `Customer ${seq}`,
+                email,
+                phone,
+                passwordHash,
+                passwordSalt,
+                // The minted password is never shown, so the owner has not
+                // chosen one. `false` is what lets them set their own once,
+                // without a current password, later.
+                passwordSet: false,
+                avatar: defaultAvatar(email),
+                roles: ["customer"]
+            });
+            const session = await issueSession(user._id);
+            return { user: toPublicUser(user), token: session.token, expiresAt: session.expiresAt };
+        } catch (error) {
+            if (error?.code === 11000) continue;
+            throw error;
+        }
+    }
+    throw new ApiError(500, "Something went wrong on our side.", [], "", "internal_error");
+};
+
+/**
+ * Resolves the account a sign-in identifier points at, or `null`.
+ *
+ * The identifier is either an email or a phone number. Email is the real
+ * unique key and resolves directly. Phone is NOT unique — quick accounts store
+ * it as contact detail and never used it to resolve — so a phone sign-in checks
+ * every account that carries it and accepts only one whose password actually
+ * matches. A bare phone number therefore signs nobody in: without the password
+ * there is no candidate, which is the whole point (a phone number is not proof
+ * of ownership without a one-time code, which this product deliberately does
+ * not use).
+ */
+const findLoginCandidate = async (identifier, password) => {
+    if (emailValidator(identifier)) return userRepo.findByEmailWithSecrets(identifier);
+
+    const candidates = await userRepo.findByPhoneWithSecrets(identifier);
+    for (const candidate of candidates) {
+        if (await bcrypt.compare(password, candidate.passwordHash)) return candidate;
+    }
+    return null;
+};
+
 const login = async (input) => {
-    const user = await userRepo.findByEmailWithSecrets(input.email);
+    const user = await findLoginCandidate(input.identifier, input.password);
 
     // Same message and the same work for both failure modes.
     const hash = user ? user.passwordHash : await getPlaceholderHash();
@@ -215,6 +302,39 @@ const changePassword = async (userId, currentPassword, newPassword, activeSessio
 
     const { passwordHash, passwordSalt } = await hashPassword(newPassword);
     await userRepo.patch(userId, { passwordHash, passwordSalt });
+
+    const result = await sessionRepo.deleteForUser(userId, activeSessionId);
+    return { changed: true, otherSessionsRevoked: (result?.deletedCount ?? 0) > 0 };
+};
+
+/**
+ * Sets the first password on a quick account — the one-time path (M14).
+ *
+ * A quick account's password was minted at random and never shown, so there is
+ * nothing the customer could type as "current"; requiring one would make the
+ * account useless on any device but the one that created it. The security of
+ * this endpoint rests entirely on `passwordSet`:
+ *
+ *   - it is only reachable while the flag is `false`, so it can be used once;
+ *   - the flag flips to `true` in the same write, so a replay (or a leaked
+ *     session on an account that already has a password) is refused;
+ *   - a normal account hydrates with the default `true`, so it can never take
+ *     this no-current-password path.
+ *
+ * Like a password change, every *other* session is revoked. The caller keeps
+ * theirs — locking out the person who just proved they hold a live session only
+ * to force a re-login buys nothing.
+ */
+const setInitialPassword = async (userId, newPassword, activeSessionId) => {
+    const user = await userRepo.findByIdWithSecrets(userId);
+    if (!user) throw notFound("Account not found.");
+
+    if (user.passwordSet !== false) {
+        throw conflict("This account already has a password. Change it from Account settings.");
+    }
+
+    const { passwordHash, passwordSalt } = await hashPassword(newPassword);
+    await userRepo.patch(userId, { passwordHash, passwordSalt, passwordSet: true });
 
     const result = await sessionRepo.deleteForUser(userId, activeSessionId);
     return { changed: true, otherSessionsRevoked: (result?.deletedCount ?? 0) > 0 };
@@ -314,12 +434,14 @@ const confirmPasswordReset = async (token, newPassword) => {
 
 export {
     register,
+    quickAccount,
     login,
     authenticateToken,
     logout,
     logoutAll,
     updateProfile,
     changePassword,
+    setInitialPassword,
     requestPasswordReset,
     confirmPasswordReset
 };
